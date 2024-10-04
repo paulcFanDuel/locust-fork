@@ -301,7 +301,12 @@ class Runner:
 
     @abstractmethod
     def start(
-        self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
+        self, user_count: int,
+        spawn_rate: float,
+        wait: bool = False,
+        user_classes: list[type[User]] | None = None,
+        remove_users=False,
+        user: User | None = None
     ) -> None: ...
 
     @abstractmethod
@@ -449,7 +454,9 @@ class LocalRunner(Runner):
 
         self.environment.events.user_error.add_listener(on_user_error)
 
-    def _start(self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list | None = None) -> None:
+    def _start(
+            self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list | None = None, remove_users: bool = False, user_to_remove: User | None = None
+        ) -> None:
         """
         Start running a load test
 
@@ -460,6 +467,8 @@ class LocalRunner(Runner):
                      started and the call to this method will return immediately.
         :param user_classes: The user classes to be dispatched, None indicates to use the classes the dispatcher was
                              invoked with.
+        :param remove_users: If true then attempt to remove user_to_remove for user_count, no users will be added.
+        :param user_to_remove: Specific user to remove.
         """
         self.target_user_count = user_count
 
@@ -488,7 +497,7 @@ class LocalRunner(Runner):
 
         logger.info("Ramping to %d users at a rate of %.2f per second" % (user_count, spawn_rate))
 
-        self._users_dispatcher.new_dispatch(user_count, spawn_rate, user_classes)
+        self._users_dispatcher.new_dispatch(user_count, spawn_rate, user_classes, remove_specific_users=remove_users, user_to_remove=user_to_remove)
 
         try:
             for dispatched_users in self._users_dispatcher:
@@ -531,8 +540,8 @@ class LocalRunner(Runner):
         self.environment.events.spawning_complete.fire(user_count=sum(self.target_user_classes_count.values()))
 
     def start(
-        self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
-    ) -> None:
+            self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None, remove_users: bool = False, user_to_remove: User = None
+        ) -> None:
         if spawn_rate > 100:
             logger.warning(
                 "Your selected spawn rate is very high (>100), and this is known to sometimes cause issues. Do you really need to ramp up that fast?"
@@ -542,7 +551,7 @@ class LocalRunner(Runner):
             # kill existing spawning_greenlet before we start a new one
             self.spawning_greenlet.kill(block=True)
         self.spawning_greenlet = self.greenlet.spawn(
-            lambda: self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
+            lambda: self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes, remove_users=remove_users, user_to_remove=user_to_remove)
         )
         self.spawning_greenlet.link_exception(greenlet_exception_handler)
 
@@ -722,8 +731,8 @@ class MasterRunner(DistributedRunner):
         return warning_emitted
 
     def start(
-        self, user_count: int, spawn_rate: float, wait=False, user_classes: list[type[User]] | None = None
-    ) -> None:
+        self, user_count: int, spawn_rate: float, wait=False, user_classes: list[type[User]] | None = None, remove_users: bool = False, user_to_remove: User = None
+        ) -> None:
         self.spawning_completed = False
 
         self.target_user_count = user_count
@@ -766,7 +775,11 @@ class MasterRunner(DistributedRunner):
         self.update_state(STATE_SPAWNING)
 
         self._users_dispatcher.new_dispatch(
-            target_user_count=user_count, spawn_rate=spawn_rate, user_classes=user_classes
+            target_user_count=user_count,
+            spawn_rate=spawn_rate,
+            user_classes=user_classes,
+            remove_specific_users=remove_users,
+            user_to_remove=user_to_remove
         )
 
         try:

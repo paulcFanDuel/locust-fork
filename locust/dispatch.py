@@ -149,7 +149,7 @@ class UsersDispatcher(Iterator):
         # Sort again, first by index within host, to ensure Users get started evenly across hosts
         self._worker_nodes = sorted(self._worker_nodes, key=lambda worker: (worker._index_within_host, worker.id))
 
-    def _dispatcher(self) -> Generator[dict[str, dict[str, int]]]:
+    def _dispatcher(self, user_to_remove: User = None, remove_specific_users: bool = False) -> Generator[dict[str, dict[str, int]]]:
         self._dispatch_in_progress = True
 
         if self._rebalance:
@@ -158,12 +158,13 @@ class UsersDispatcher(Iterator):
             if self._current_user_count == self._target_user_count:
                 return
 
-        if self._current_user_count == self._target_user_count:
+        if self._current_user_count == self._target_user_count and not remove_specific_users:
             yield self._initial_users_on_workers
             self._dispatch_in_progress = False
             return
 
-        while self._current_user_count < self._target_user_count:
+        #PC DO we need to stick the and not remove user flag here  
+        while self._current_user_count < self._target_user_count and not remove_specific_users:
             with self._wait_between_dispatch_iteration_context():
                 yield self._add_users_on_workers()
                 if self._rebalance:
@@ -173,9 +174,16 @@ class UsersDispatcher(Iterator):
                     self._no_user_to_spawn = False
                     break
 
-        while self._current_user_count > self._target_user_count:
+        while self._current_user_count > self._target_user_count and not remove_specific_users:
+                with self._wait_between_dispatch_iteration_context():
+                    yield self._remove_users_from_workers()
+                    if self._rebalance:
+                        self._rebalance = False
+                        yield self._users_on_workers
+        
+        while remove_specific_users and self._target_user_count:
             with self._wait_between_dispatch_iteration_context():
-                yield self._remove_users_from_workers()
+                yield self._remove_specific_users_from_workers(user_to_remove)
                 if self._rebalance:
                     self._rebalance = False
                     yield self._users_on_workers
@@ -183,7 +191,11 @@ class UsersDispatcher(Iterator):
         self._dispatch_in_progress = False
 
     def new_dispatch(
-        self, target_user_count: int, spawn_rate: float, user_classes: list[type[User]] | None = None
+        self, target_user_count: int, 
+        spawn_rate: float, 
+        user_classes: list[type[User]] | None = None, 
+        remove_specific_users: bool = False,
+        user_to_remove:User | None  = None
     ) -> None:
         """
         Initialize a new dispatch cycle.
@@ -210,8 +222,9 @@ class UsersDispatcher(Iterator):
 
         self._current_user_count = self.get_current_user_count()
 
-        self._dispatcher_generator = self._dispatcher()
-
+        # PC Butchered this to pass params in where there was none before
+        self._dispatcher_generator =  self._dispatcher(user_to_remove=user_to_remove, remove_specific_users=remove_specific_users) 
+        
         self._dispatch_iteration_durations.clear()
 
     def add_worker(self, worker_node: WorkerNode) -> None:
@@ -327,6 +340,53 @@ class UsersDispatcher(Iterator):
             self._current_user_count -= 1
             self._try_dispatch_fixed = True
             if self._current_user_count == 0 or self._current_user_count <= current_user_count_target:
+                return self._users_on_workers
+            
+    def _remove_specific_users_from_workers(self, user_class: User = None) -> dict[str, dict[str, int]]:
+        """Remove specific user from the workers until the target number of users are removed for the current dispatch iteration.
+
+        :return: The users that we want to run on the workers
+        """
+        index_to_pop = None
+        i = 0
+
+        # Calculate how many users of the specific type we want to remove exist
+        specific_user_count = len([user[1] for user in self._active_users if user[1]==user_class.__name__])
+
+        # Reset self._target_user_count if no users to remove
+        if not specific_user_count:
+            self._target_user_count = 0
+            return self._users_on_workers
+            
+        # Calculate target count for current dispatch iteration
+        current_user_count_target =  min(specific_user_count, self._user_count_per_dispatch_iteration)
+        
+        while True:
+            # We need to match the index of the user type we want to remove to the user list
+            for i in range(0, len(self._active_users)):
+                if self._active_users[i][1] == user_class.__name__:
+                    index_to_pop = i
+                    break
+                i +=1
+
+            # If no users exist to pop then return existing users on worker
+            if index_to_pop is None:
+                self._target_user_count = 0
+                return self._users_on_workers
+            try:
+                worker_node, user = self._active_users.pop(index_to_pop)
+            except IndexError:
+                return self._users_on_workers
+            
+            self._users_on_workers[worker_node.id][user] -= 1
+            self._current_user_count -= 1            
+            self._target_user_count -=1
+            current_user_count_target -=1
+
+            self._try_dispatch_fixed = True
+            
+            # Bail out if no more users to remove or target user remval counts met
+            if self._current_user_count == 0 or current_user_count_target <= 0 or self._target_user_count <= 0:
                 return self._users_on_workers
 
     def _get_user_current_count(self, user: str) -> int:
